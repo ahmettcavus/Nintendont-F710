@@ -1,0 +1,94 @@
+name: Build Nintendont F710
+
+on:
+  workflow_dispatch:
+    inputs:
+      debug_hid:
+        description: "Debug build (writes USB controller messages to ndebug.log)"
+        type: boolean
+        default: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    container:
+      image: devkitpro/devkitppc:latest
+
+    env:
+      DEVKITPRO: /opt/devkitpro
+      DEVKITPPC: /opt/devkitpro/devkitPPC
+      DEVKITARM: /opt/devkitpro/devkitARM
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Apply F710 changes
+        run: |
+          set -eu
+          f=kernel/HID.c
+          # 1. Treat the Logitech F710 in X mode (046D:C21F) as the Xbox 360 controller
+          sed -i 's/(DeviceVID == 0x045e \&\& DevicePID == 0x028e)/(DeviceVID == 0x046d \&\& DevicePID == 0xc21f)/' $f
+          # 2. Skip every USB device except the F710 (keeps USB drives untouched, accepts OUT-first endpoint order)
+          sed -i 's/if (isXBOX \&\& bEndpointAddress != 0x81)/if (!isXBOX)/' $f
+          # 3. Full-power rumble on both motors
+          sed -i 's/HIDXBOX360SetRumble( 0, 128, 0, 1 );/HIDXBOX360SetRumble( 0, 255, 0, 255 );/' $f
+          # Fail the build if any change did not apply
+          grep -q 'DevicePID == 0xc21f' $f
+          grep -q 'if (!isXBOX)' $f
+          grep -q 'HIDXBOX360SetRumble( 0, 255, 0, 255 );' $f
+          echo "F710 changes applied"
+
+      - name: Enable USB controller debug messages
+        if: ${{ inputs.debug_hid }}
+        run: |
+          set -eu
+          sed -i '1i #define DEBUG_HID' kernel/HID.c
+          head -3 kernel/HID.c
+
+      - name: Preserve devkitPPC rule files
+        run: |
+          set -eu
+          mkdir -p /tmp/nintendont-rules
+          find "$DEVKITPPC" -maxdepth 1 -type f -exec cp -v {} /tmp/nintendont-rules/ \;
+
+      - name: Download historical toolchains
+        run: |
+          set -eu
+          mkdir -p /tmp/nintendont-tools
+          cd /tmp/nintendont-tools
+          curl -fL --retry 3 -o arm.pkg.tar.xz \
+            'https://wii.leseratte10.de/devkitPro/devkitARM/r53%20%282019-06%29/devkitARM-r53-1-linux.pkg.tar.xz'
+          curl -fL --retry 3 -o ppc.pkg.tar.xz \
+            'https://wii.leseratte10.de/devkitPro/devkitPPC/r35/devkitPPC-r35-1-linux.pkg.tar.xz'
+          curl -fL --retry 3 -o libogc.pkg.tar.xz \
+            'https://wii.leseratte10.de/devkitPro/libogc/libogc_1.8.23%20%282019-10-02%29/libogc-1.8.23-1-any.pkg.tar.xz'
+          ls -lh *.pkg.tar.xz
+
+      - name: Install historical toolchains
+        run: |
+          set -eu
+          cd /tmp/nintendont-tools
+          rm -rf "$DEVKITARM" "$DEVKITPPC" "$DEVKITPRO/libogc"
+          tar -xJf arm.pkg.tar.xz -C /
+          tar -xJf ppc.pkg.tar.xz -C /
+          tar -xJf libogc.pkg.tar.xz -C /
+          cp -v /tmp/nintendont-rules/* "$DEVKITPPC/"
+          "$DEVKITARM/bin/arm-none-eabi-gcc" --version
+          "$DEVKITPPC/bin/powerpc-eabi-gcc" --version
+
+      - name: Compile Nintendont
+        run: |
+          set -eu
+          export PATH="$DEVKITPPC/bin:$DEVKITARM/bin:$PATH"
+          make -j1
+          cp loader/loader.dol loader/boot.dol
+
+      - name: Upload boot.dol
+        uses: actions/upload-artifact@v4
+        with:
+          name: Nintendont-F710-boot-dol
+          path: loader/boot.dol
+          if-no-files-found: error
+          
