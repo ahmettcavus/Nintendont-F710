@@ -40,6 +40,18 @@ jobs:
           grep -q 'HIDXBOX360SetRumble( 0, 255, 0, 255 );' $f
           echo "F710 changes applied"
 
+      - name: Fix phantom stick input
+        run: |
+          set -eu
+          f=kernel/HID.c
+          # 4. Non-input packets (startup/status messages) no longer overwrite the pad state with zeros
+          perl -0pi -e 's{\{\s*// ignore the 4 startup messages\s*u8 i;\s*for \(i = 0; i < wMaxPacketSize; i\+\+\)\s*Packet\[i\] = 0;\s*\}}{\{\r\n\t\t// not an input report (startup/status message): keep the last real input\r\n\t\tHIDInterruptBulkMessage(Packet, wMaxPacketSize, bEndpointAddressController, hidqueue, hidreadcontrollermsg);\r\n\t\treturn;\r\n\t\}}' $f
+          # 5. Start Xbox-type pads with centered sticks instead of all zeros (0 = stick pushed to the edge)
+          perl -0pi -e 's{(memset32\(HID_Packet, 0, MemPacketSize\);)}{$1\r\n\t\t\t\tif (isXBOX)\r\n\t\t\t\t\t{ u8 *p = (u8*)HID_Packet; p[6] = p[7] = p[8] = p[9] = 0x80; } // centered sticks}' $f
+          grep -q 'keep the last real input' $f
+          grep -q 'p\[9\] = 0x80' $f
+          echo "Phantom stick fix applied"
+
       - name: Enable USB controller debug messages
         if: ${{ inputs.debug_hid }}
         run: |
@@ -88,7 +100,7 @@ jobs:
       - name: Upload boot.dol
         uses: actions/upload-artifact@v4
         with:
+        
           name: Nintendont-F710-boot-dol
           path: loader/boot.dol
           if-no-files-found: error
-          
