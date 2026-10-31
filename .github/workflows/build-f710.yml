@@ -92,56 +92,46 @@ jobs:
         run: |
           set -eu
           f=kernel/HID.c
-          # 8. While no controller is connected, open a fresh USB connection every ~2 s,
-          #    read the current device list (answered immediately on a new connection)
-          #    and pick up the F710 once it has finished switching to X mode.
-          cat > /tmp/f710_poll.c <<'EOF'
-          #define F710_POLL_TICKS 1000
-          static usb_device_entry F710PollDevices[32] ALIGNED(32);
+          # 8. While no controller is connected, close and reopen the fork's USB connection every ~3 s.
+          #    A newly opened connection gets the current device list immediately (as at startup),
+          #    so the F710 is found again once it has finished switching to X mode.
+          #    A second message buffer is used so a cancelled request on the old connection can't collide.
+          # 8a. Extra message buffer + pointer to the one in use (declared before HIDInit)
+          perl -0pi -e 's/(static vu32 hidread = 0, keyboardread = 0, hidchange = 0, hidattach = 0, hidattached = 0, hidwaittimer = 0;)/$1\r\nstatic struct ipcmessage *hidchangemsg2 = NULL, *hidchangecur = NULL;/' $f
+          # 8b. Allocate it in HIDInit
+          perl -0pi -e 's/(hidchangemsg = \(struct ipcmessage\*\)malloca\(sizeof\(struct ipcmessage\), 32\);)/$1\r\n\thidchangemsg2 = (struct ipcmessage*)malloca(sizeof(struct ipcmessage), 32);\r\n\thidchangecur = hidchangemsg;/' $f
+          # 8c. Both buffers count as "device change" in the message thread
+          perl -0pi -e 's/else if\(msg == hidchangemsg\)/else if(msg == hidchangemsg || msg == hidchangemsg2)/' $f
+          # 8d. Re-arming after a scan uses whichever buffer is current
+          perl -0pi -e 's/(HIDOpen\(LoaderRequest\);\s*memset32\(AttachedDevices, 0, sizeof\(usb_device_entry\)\*32\);\s*IOS_IoctlAsync\(HIDHandle, GetDeviceChange, NULL, 0, AttachedDevices, 0x180, hidqueue, )hidchangemsg\);/${1}hidchangecur);/' $f
+          # 8e. The reopen function
+          cat > /tmp/f710_reopen.c <<'EOF'
+          #define F710_POLL_TICKS 1500
           static u32 F710PollTimer = 0;
-          static s32 F710PollLastCount = -1000;
-          static void F710PollForController(u32 LoaderRequest)
+          static void F710ReopenUSB(void)
           {
-          	s32 h, n, r;
-          	u32 i, found = 0;
+          	s32 h;
+          	IOS_Close(HIDHandle);
           	h = IOS_Open("/dev/usb/ven", 0);
+          	dbgprintf("HID:reopen connection:%d\r\n", h);
+          	HIDHandle = h;
           	if (h < 0)
-          	{
-          		dbgprintf("HID:poll open failed:%d\r\n", h);
           		return;
-          	}
-          	memset32(F710PollDevices, 0, sizeof(usb_device_entry)*32);
-          	n = IOS_Ioctl(h, GetDeviceChange, NULL, 0, F710PollDevices, 0x180);
-          	r = IOS_Ioctl(h, AttachFinish, NULL, 0, NULL, 0);
-          	IOS_Close(h);
-          	for (i = 0; i < 32; ++i)
-          	{
-          		if (F710PollDevices[i].vid == 0x046d && F710PollDevices[i].pid == 0xc21f)
-          			found = 1;
-          	}
-          	if (n != F710PollLastCount || found)
-          	{
-          		dbgprintf("HID:poll entries:%d attachfinish:%d f710:%u\r\n", n, r, found);
-          		for (i = 0; i < 32; ++i)
-          		{
-          			if (F710PollDevices[i].vid != 0)
-          				dbgprintf("HID:poll dev %04X:%04X id:%08X\r\n", F710PollDevices[i].vid, F710PollDevices[i].pid, F710PollDevices[i].device_id);
-          		}
-          		F710PollLastCount = n;
-          	}
-          	if (found)
-          	{
-          		memcpy(AttachedDevices, F710PollDevices, sizeof(usb_device_entry)*32);
-          		HIDOpen(LoaderRequest);
-          	}
+          	hidchangecur = (hidchangecur == hidchangemsg) ? hidchangemsg2 : hidchangemsg;
+          	memset32(AttachedDevices, 0, sizeof(usb_device_entry)*32);
+          	h = IOS_IoctlAsync(HIDHandle, GetDeviceChange, NULL, 0, AttachedDevices, 0x180, hidqueue, hidchangecur);
+          	dbgprintf("HID:reopen GetDeviceChange:%d\r\n", h);
           }
 
           EOF
-          sed -i 's/^          //' /tmp/f710_poll.c
-          perl -0pi -e 'BEGIN { local $/; open(my $fh, "<", "/tmp/f710_poll.c") or die; $poll = <$fh>; $poll =~ s/\r?\n/\r\n/g; } s/(void HIDUpdateRegisters\(u32 LoaderRequest\))/$poll$1/' $f
-          perl -0pi -e 's/(\r\n)(\t\tif\(hidattached\)\r\n)/$1\t\tif(hidattached \&\& ControllerID == 0 \&\& hidchange == 0)\r\n\t\t{\r\n\t\t\tif(++F710PollTimer >= F710_POLL_TICKS)\r\n\t\t\t{\r\n\t\t\t\tF710PollTimer = 0;\r\n\t\t\t\tF710PollForController(LoaderRequest);\r\n\t\t\t}\r\n\t\t}\r\n\t\telse\r\n\t\t\tF710PollTimer = 0;\r\n$2/' $f
-          test "$(grep -c 'F710PollForController(LoaderRequest);' $f)" = "1"
-          grep -q 'static void F710PollForController' $f
+          sed -i 's/^          //' /tmp/f710_reopen.c
+          perl -0pi -e 'BEGIN { local $/; open(my $fh, "<", "/tmp/f710_reopen.c") or die; $fn = <$fh>; $fn =~ s/\r?\n/\r\n/g; } s/(void HIDUpdateRegisters\(u32 LoaderRequest\))/$fn$1/' $f
+          # 8f. Call it while no controller is connected (and no scan is in progress)
+          perl -0pi -e 's/(\r\n)(\t\tif\(hidattached\)\r\n)/$1\t\tif(hidattached \&\& ControllerID == 0 \&\& hidchange == 0)\r\n\t\t{\r\n\t\t\tif(++F710PollTimer >= F710_POLL_TICKS)\r\n\t\t\t{\r\n\t\t\t\tF710PollTimer = 0;\r\n\t\t\t\tF710ReopenUSB();\r\n\t\t\t}\r\n\t\t}\r\n\t\telse\r\n\t\t\tF710PollTimer = 0;\r\n$2/' $f
+          grep -q 'hidchangemsg2 = (struct ipcmessage\*)malloca' $f
+          grep -q 'msg == hidchangemsg || msg == hidchangemsg2' $f
+          grep -q 'hidqueue, hidchangecur);' $f
+          test "$(grep -c 'F710ReopenUSB();' $f)" = "1"
           echo "Replug detection added"
 
       - name: Enable USB controller debug messages
@@ -152,7 +142,7 @@ jobs:
           sed -i '1i #define DEBUG_HID' $f
           # Log every USB change event and whether the next change request was accepted
           perl -0pi -e 's{IOS_IoctlAsync\(HIDHandle, AttachFinish, NULL, 0, NULL, 0, hidqueue, hidattachmsg\);}{\{ s32 dbg_r = IOS_IoctlAsync(HIDHandle, AttachFinish, NULL, 0, NULL, 0, hidqueue, hidattachmsg); dbgprintf("HID:change event, AttachFinish queued:%d\\r\\n", dbg_r); \}}' $f
-          perl -0pi -e 's#(HIDOpen\(LoaderRequest\);\s*memset32\(AttachedDevices, 0, sizeof\(usb_device_entry\)\*32\);\s*)IOS_IoctlAsync\(HIDHandle, GetDeviceChange, NULL, 0, AttachedDevices, 0x180, hidqueue, hidchangemsg\);#${1}{ s32 dbg_r = IOS_IoctlAsync(HIDHandle, GetDeviceChange, NULL, 0, AttachedDevices, 0x180, hidqueue, hidchangemsg); dbgprintf("HID:GetDeviceChange re-armed:%d\\r\\n", dbg_r); }#' $f
+          perl -0pi -e 's#(HIDOpen\(LoaderRequest\);\s*memset32\(AttachedDevices, 0, sizeof\(usb_device_entry\)\*32\);\s*)IOS_IoctlAsync\(HIDHandle, GetDeviceChange, NULL, 0, AttachedDevices, 0x180, hidqueue, (hidchangemsg|hidchangecur)\);#${1}{ s32 dbg_r = IOS_IoctlAsync(HIDHandle, GetDeviceChange, NULL, 0, AttachedDevices, 0x180, hidqueue, ${2}); dbgprintf("HID:GetDeviceChange re-armed:%d\\r\\n", dbg_r); }#' $f
           # Log the first 30 non-button packets the receiver sends
           perl -0pi -e 's#(// not an input report \(startup/status message\): keep the last real input|// ignore the 4 startup messages)#${1}\r\n\t\t{ static u32 dbg_n = 0; if (dbg_n < 30) { dbg_n++; dbgprintf("HID:non-input packet %02X %02X %02X %02X\\r\\n", Packet[0], Packet[1], Packet[2], Packet[3]); } }#' $f
           grep -q 'AttachFinish queued' $f
