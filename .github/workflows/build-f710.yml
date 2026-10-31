@@ -51,13 +51,26 @@ jobs:
           grep -q 'keep the last real input' $f
           grep -q 'p\[9\] = 0x80' $f
           echo "Phantom stick fix applied"
+          # 6. Don't send rumble/LED commands when no controller is connected (stops errors after unplugging)
+          sed -i 's/if (bEndpointAddressOut == 0)/if (bEndpointAddressOut == 0 || ControllerID == 0)/' $f
+          test "$(grep -c 'bEndpointAddressOut == 0 || ControllerID == 0' $f)" = "2"
+          echo "Unplugged-rumble fix applied"
 
       - name: Enable USB controller debug messages
         if: ${{ inputs.debug_hid }}
         run: |
           set -eu
-          sed -i '1i #define DEBUG_HID' kernel/HID.c
-          head -3 kernel/HID.c
+          f=kernel/HID.c
+          sed -i '1i #define DEBUG_HID' $f
+          # Log every USB change event and whether the next change request was accepted
+          perl -0pi -e 's{IOS_IoctlAsync\(HIDHandle, AttachFinish, NULL, 0, NULL, 0, hidqueue, hidattachmsg\);}{\{ s32 dbg_r = IOS_IoctlAsync(HIDHandle, AttachFinish, NULL, 0, NULL, 0, hidqueue, hidattachmsg); dbgprintf("HID:change event, AttachFinish queued:%d\\r\\n", dbg_r); \}}' $f
+          perl -0pi -e 's#(HIDOpen\(LoaderRequest\);\s*memset32\(AttachedDevices, 0, sizeof\(usb_device_entry\)\*32\);\s*)IOS_IoctlAsync\(HIDHandle, GetDeviceChange, NULL, 0, AttachedDevices, 0x180, hidqueue, hidchangemsg\);#${1}{ s32 dbg_r = IOS_IoctlAsync(HIDHandle, GetDeviceChange, NULL, 0, AttachedDevices, 0x180, hidqueue, hidchangemsg); dbgprintf("HID:GetDeviceChange re-armed:%d\\r\\n", dbg_r); }#' $f
+          # Log the first 30 non-button packets the receiver sends
+          perl -0pi -e 's#(// not an input report \(startup/status message\): keep the last real input)#${1}\r\n\t\t{ static u32 dbg_n = 0; if (dbg_n < 30) { dbg_n++; dbgprintf("HID:non-input packet %02X %02X %02X %02X\\r\\n", Packet[0], Packet[1], Packet[2], Packet[3]); } }#' $f
+          grep -q 'AttachFinish queued' $f
+          grep -q 'GetDeviceChange re-armed' $f
+          grep -q 'non-input packet' $f
+          echo "Debug logging added"
 
       - name: Preserve devkitPPC rule files
         run: |
@@ -100,7 +113,6 @@ jobs:
       - name: Upload boot.dol
         uses: actions/upload-artifact@v4
         with:
-        
           name: Nintendont-F710-boot-dol
           path: loader/boot.dol
           if-no-files-found: error
