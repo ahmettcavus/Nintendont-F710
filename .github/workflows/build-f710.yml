@@ -92,7 +92,7 @@ jobs:
         run: |
           set -eu
           f=kernel/HID.c
-          # 8. While no controller is connected, close and reopen the fork's USB connection every ~3 s.
+          # 8. While no controller is connected, shut down, close and reopen the fork's USB connection every ~3 s.
           #    A newly opened connection gets the current device list immediately (as at startup),
           #    so the F710 is found again once it has finished switching to X mode.
           #    A second message buffer is used so a cancelled request on the old connection can't collide.
@@ -111,6 +111,8 @@ jobs:
           static void F710ReopenUSB(void)
           {
           	s32 h;
+          	h = IOS_Ioctl(HIDHandle, 2, NULL, 0, NULL, 0); // USBV5 Shutdown: release devices, as the loader does before closing
+          	dbgprintf("HID:reopen shutdown:%d\r\n", h);
           	IOS_Close(HIDHandle);
           	h = IOS_Open("/dev/usb/ven", 0);
           	dbgprintf("HID:reopen connection:%d\r\n", h);
@@ -194,3 +196,4 @@ jobs:
           name: Nintendont-F710-boot-dol
           path: loader/boot.dol
           if-no-files-found: error
+          
